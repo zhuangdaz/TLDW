@@ -20,6 +20,8 @@ interface TranscriptViewerProps {
   citationHighlight?: Citation | null;
   onTakeNoteFromSelection?: (payload: SelectionActionPayload) => void;
   videoId?: string;
+  selectedLanguage?: string | null;
+  onRequestTranslation?: (text: string, segmentIndex: number) => Promise<string>;
 }
 
 export function TranscriptViewer({
@@ -30,7 +32,9 @@ export function TranscriptViewer({
   topics = [],
   citationHighlight,
   onTakeNoteFromSelection,
-  videoId
+  videoId,
+  selectedLanguage = null,
+  onRequestTranslation
 }: TranscriptViewerProps) {
   const highlightedRefs = useRef<(HTMLDivElement | null)[]>([]);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
@@ -40,11 +44,58 @@ export function TranscriptViewer({
   const [showScrollToCurrentButton, setShowScrollToCurrentButton] = useState(false);
   const lastUserScrollTime = useRef<number>(0);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [translationsCache, setTranslationsCache] = useState<Map<number, string>>(new Map());
+  const [loadingTranslations, setLoadingTranslations] = useState<Set<number>>(new Set());
+  const [translationErrors, setTranslationErrors] = useState<Set<number>>(new Set());
   const selectedTopicIndex = selectedTopic
     ? topics.findIndex((topic) => topic.id === selectedTopic.id)
     : -1;
   const selectedTopicColor =
     selectedTopicIndex >= 0 ? getTopicHSLColor(selectedTopicIndex, videoId) : null;
+
+  const requestTranslation = useCallback(async (segmentIndex: number) => {
+    const translationEnabled = selectedLanguage !== null;
+    if (!onRequestTranslation || !translationEnabled || loadingTranslations.has(segmentIndex) || translationsCache.has(segmentIndex)) {
+      return;
+    }
+
+    const segment = transcript[segmentIndex];
+    if (!segment || !segment.text?.trim()) {
+      return;
+    }
+
+    setLoadingTranslations(prev => new Set(prev).add(segmentIndex));
+    // Clear any previous error state
+    setTranslationErrors(prev => {
+      const next = new Set(prev);
+      next.delete(segmentIndex);
+      return next;
+    });
+
+    try {
+      // Include language in cache key to allow caching per language
+      const cacheKey = `transcript:${segmentIndex}:${selectedLanguage}`;
+      const translation = await onRequestTranslation(segment.text, cacheKey);
+      setTranslationsCache(prev => new Map(prev).set(segmentIndex, translation));
+    } catch (error) {
+      console.error('Translation failed for segment', segmentIndex, error);
+      // Mark segment as failed so UI can show retry option
+      setTranslationErrors(prev => new Set(prev).add(segmentIndex));
+    } finally {
+      setLoadingTranslations(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(segmentIndex);
+        return newSet;
+      });
+    }
+  }, [onRequestTranslation, selectedLanguage, loadingTranslations, translationsCache, transcript]);
+
+  // Clear translations cache when language changes
+  useEffect(() => {
+    setTranslationsCache(new Map());
+    setLoadingTranslations(new Set());
+    setTranslationErrors(new Set());
+  }, [selectedLanguage]);
 
   // Clear refs when topic changes
   useEffect(() => {
@@ -536,10 +587,19 @@ export function TranscriptViewer({
                 const highlightedText = getHighlightedText(segment, index);
                 const isCurrent = index === currentSegmentIndex;
                 getSegmentTopic(segment);
-                
-                const hasHighlight = highlightedText !== null;
 
-            return (
+                const hasHighlight = highlightedText !== null;
+                const translation = translationsCache.get(index);
+                const isLoadingTranslation = loadingTranslations.has(index);
+                const hasTranslationError = translationErrors.has(index);
+                const translationEnabled = selectedLanguage !== null;
+
+                // Request translation if enabled and not already cached/loading/errored
+                if (translationEnabled && !translation && !isLoadingTranslation && !hasTranslationError) {
+                  requestTranslation(index);
+                }
+
+                return (
                   <div
                     key={index}
                     data-segment-index={index}
@@ -555,14 +615,16 @@ export function TranscriptViewer({
                       }
                     }}
                     className={cn(
-                      "group relative px-2.5 py-1.5 rounded-xl transition-all duration-200"
+                      "group relative px-2.5 py-1.5 rounded-xl transition-all duration-200",
+                      translationEnabled && "space-y-1"
                     )}
                   >
-                    {/* Transcript text with partial highlighting */}
+                    {/* Original text */}
                     <p 
                       className={cn(
                         "text-sm leading-relaxed",
-                        isCurrent ? "text-foreground font-medium" : "text-muted-foreground"
+                        isCurrent ? "text-foreground font-medium" : "text-muted-foreground",
+                        translationEnabled && "text-xs opacity-80"
                       )}
                     >
                       {highlightedText ? (
@@ -601,9 +663,42 @@ export function TranscriptViewer({
                       )}
                     </p>
 
+                    {/* Translated text */}
+                    {translationEnabled && (
+                      <div className="flex items-start gap-2">
+                        <p
+                          className={cn(
+                            "text-sm leading-relaxed flex-1",
+                            isCurrent ? "text-foreground font-medium" : "text-muted-foreground"
+                          )}
+                        >
+                          {isLoadingTranslation ? (
+                            <span className="text-muted-foreground italic">Translating...</span>
+                          ) : hasTranslationError ? (
+                            <span className="text-red-500/70 italic text-xs">Translation failed</span>
+                          ) : translation ? (
+                            translation
+                          ) : (
+                            <span className="text-muted-foreground/50 italic">Translation pending...</span>
+                          )}
+                        </p>
+                        {hasTranslationError && (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              requestTranslation(index);
+                            }}
+                            className="text-xs text-blue-500 hover:text-blue-600 underline shrink-0"
+                          >
+                            Retry
+                          </button>
+                        )}
+                      </div>
+                    )}
+
                   </div>
-            );
-          });
+                );
+              });
             })()
           )}
         </div>

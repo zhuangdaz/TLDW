@@ -17,6 +17,7 @@ import { SelectionActionPayload, EXPLAIN_SELECTION_EVENT } from "@/components/se
 import { fetchNotes, saveNote } from "@/lib/notes-client";
 import { EditingNote } from "@/components/notes-panel";
 import { useModePreference } from "@/lib/hooks/use-mode-preference";
+import { TranslationBatcher } from "@/lib/translation-batcher";
 
 // Page state for better UX
 type PageState = 'IDLE' | 'ANALYZING_NEW' | 'LOADING_CACHED';
@@ -129,6 +130,7 @@ export default function AnalyzePage() {
   const nextThemeRequestIdRef = useRef(0);
   const activeThemeRequestIdRef = useRef<number | null>(null);
   const pendingThemeRequestsRef = useRef(new Map<string, number>());
+  const translationBatcherRef = useRef<TranslationBatcher | null>(null);
 
   // Play All state (lifted from YouTubePlayer)
   const [isPlayingAll, setIsPlayingAll] = useState(false);
@@ -151,6 +153,10 @@ export default function AnalyzePage() {
 
   // Cached suggested questions
   const [cachedSuggestedQuestions, setCachedSuggestedQuestions] = useState<string[] | null>(null);
+
+  // Translation state - null means English (no translation), otherwise language code
+  const [selectedLanguage, setSelectedLanguage] = useState<string | null>(null);
+  const [translationCache, setTranslationCache] = useState<Map<string, string>>(new Map());
 
   // Use custom hook for timer logic
   const elapsedTime = useElapsedTimer(generationStartTime);
@@ -355,9 +361,14 @@ export default function AnalyzePage() {
   // Cleanup AbortManager on component unmount
   useEffect(() => {
     const currentAbortManager = abortManager.current;
+    const currentBatcher = translationBatcherRef.current;
     return () => {
       // Abort all pending requests when component unmounts
       currentAbortManager.cleanup();
+      // Clear any pending translation batches
+      if (currentBatcher) {
+        currentBatcher.clear();
+      }
     };
   }, []);
 
@@ -1502,6 +1513,59 @@ export default function AnalyzePage() {
     setEditingNote(null);
   }, []);
 
+  // Translation handler with batching
+  const handleRequestTranslation = useCallback(async (text: string, cacheKey: string): Promise<string> => {
+    if (!selectedLanguage) return text;
+
+    // Initialize batcher lazily on first use
+    if (!translationBatcherRef.current) {
+      translationBatcherRef.current = new TranslationBatcher(
+        50, // Wait 50ms to collect translation requests
+        100, // Max 100 translations per batch
+        translationCache,
+        selectedLanguage // Pass the target language
+      );
+    }
+
+    // Use the batcher - it will automatically batch requests and cache results
+    const translation = await translationBatcherRef.current.translate(text, cacheKey);
+
+    // Sync cache state (the batcher updates the Map, but we need to trigger re-render)
+    // Implements LRU-like eviction to prevent unbounded memory growth
+    setTranslationCache(prev => {
+      if (prev.has(cacheKey) && prev.get(cacheKey) === translation) {
+        return prev; // No change, don't trigger re-render
+      }
+
+      const next = new Map(prev);
+
+      // Evict oldest entry if cache exceeds limit (500 entries ~= 50KB)
+      const MAX_CACHE_SIZE = 500;
+      if (next.size >= MAX_CACHE_SIZE) {
+        const firstKey = next.keys().next().value;
+        next.delete(firstKey);
+      }
+
+      next.set(cacheKey, translation);
+      return next;
+    });
+
+    return translation;
+  }, [translationCache, selectedLanguage]);
+
+  const handleLanguageChange = useCallback((languageCode: string | null) => {
+    setSelectedLanguage(languageCode);
+    // Keep cache since keys are now language-aware (e.g., "topic-1:es", "topic-1:fr")
+    // No need to clear - different languages use different cache keys
+    if (translationBatcherRef.current && languageCode) {
+      translationBatcherRef.current.updateLanguage(languageCode);
+    } else if (translationBatcherRef.current) {
+      // If switching back to English (null), clear the batcher entirely
+      translationBatcherRef.current.clear();
+      translationBatcherRef.current = null;
+    }
+  }, []);
+
   return (
     <div className="min-h-screen bg-white pt-12 pb-2">
       {pageState === 'IDLE' && !videoId && !routeVideoId && !urlParam && (
@@ -1661,6 +1725,8 @@ export default function AnalyzePage() {
                   transcript={transcript}
                   isLoadingThemeTopics={isLoadingThemeTopics}
                   videoId={videoId ?? undefined}
+                  selectedLanguage={selectedLanguage}
+                  onRequestTranslation={handleRequestTranslation}
                 />
               </div>
             </div>
@@ -1694,6 +1760,9 @@ export default function AnalyzePage() {
                   onCancelEditing={handleCancelEditing}
                   isAuthenticated={!!user}
                   onRequestSignIn={promptSignInForNotes}
+                  selectedLanguage={selectedLanguage}
+                  onRequestTranslation={handleRequestTranslation}
+                  onLanguageChange={handleLanguageChange}
                 />
               </div>
             </div>
