@@ -1,7 +1,8 @@
 import { createClient } from '@/lib/supabase/server';
+import type { SubscriptionTier } from '@/lib/subscription-manager';
+import crypto from 'crypto';
 import { headers } from 'next/headers';
 import { NextResponse } from 'next/server';
-import crypto from 'crypto';
 
 interface RateLimitConfig {
   windowMs: number; // Time window in milliseconds
@@ -210,7 +211,7 @@ export const RATE_LIMITS = {
     maxRequests: 10 // 10 messages per minute
   },
 
-  // Authenticated users
+  // Authenticated users (legacy - kept for backwards compatibility)
   AUTH_GENERATION: {
     windowMs: 60 * 60 * 1000, // 1 hour
     maxRequests: 20 // 20 generations per hour
@@ -224,6 +225,20 @@ export const RATE_LIMITS = {
     maxRequests: 30 // 30 messages per minute
   },
 
+  // Subscription tier video generation limits (rolling 30-day window)
+  VIDEO_GENERATION_FREE_UNREGISTERED: {
+    windowMs: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxRequests: 1 // 1 video per 30 days for anonymous users
+  },
+  VIDEO_GENERATION_FREE_REGISTERED: {
+    windowMs: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxRequests: 5 // 5 videos per 30 days for free registered users
+  },
+  VIDEO_GENERATION_PRO: {
+    windowMs: 30 * 24 * 60 * 60 * 1000, // 30 days
+    maxRequests: 100 // 100 videos per 30 days for Pro subscribers
+  },
+
   // General API endpoints
   API_GENERAL: {
     windowMs: 60 * 1000, // 1 minute
@@ -235,7 +250,6 @@ export const RATE_LIMITS = {
     windowMs: 15 * 60 * 1000, // 15 minutes
     maxRequests: 5 // 5 login attempts per 15 minutes
   },
-
   // Translation operations
   ANON_TRANSLATION: {
     windowMs: 60 * 1000, // 1 minute
@@ -244,6 +258,11 @@ export const RATE_LIMITS = {
   AUTH_TRANSLATION: {
     windowMs: 60 * 1000, // 1 minute
     maxRequests: 30 // 30 API calls per minute for authenticated users
+  },
+  // Read-only endpoints (status checks, etc.)
+  READ_ONLY: {
+    windowMs: 60 * 1000, // 1 minute
+    maxRequests: 100 // 100 requests per minute
   }
 };
 
@@ -274,4 +293,17 @@ export function rateLimitResponse(
   }
 
   return null; // Request allowed
+}
+
+export function getPlanLimiter(
+  tier: SubscriptionTier | 'anonymous'
+): RateLimitConfig {
+  switch (tier) {
+    case 'pro':
+      return RATE_LIMITS.VIDEO_GENERATION_PRO;
+    case 'free':
+      return RATE_LIMITS.VIDEO_GENERATION_FREE_REGISTERED;
+    default:
+      return RATE_LIMITS.VIDEO_GENERATION_FREE_UNREGISTERED;
+  }
 }

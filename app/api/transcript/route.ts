@@ -3,35 +3,42 @@ import { extractVideoId } from '@/lib/utils';
 import { withSecurity, SECURITY_PRESETS } from '@/lib/security-middleware';
 import { shouldUseMockData, getMockTranscript } from '@/lib/mock-data';
 import { mergeTranscriptSegmentsIntoSentences } from '@/lib/transcript-sentence-merger';
+import { NO_CREDITS_USED_MESSAGE } from '@/lib/no-credits-message';
+
+function respondWithNoCredits(
+  payload: Record<string, unknown>,
+  status: number
+) {
+  return NextResponse.json(
+    {
+      ...payload,
+      creditsMessage: NO_CREDITS_USED_MESSAGE,
+      noCreditsUsed: true
+    },
+    { status }
+  );
+}
 
 async function handler(request: NextRequest) {
   try {
     const { url } = await request.json();
 
     if (!url) {
-      return NextResponse.json(
-        { error: 'YouTube URL is required' },
-        { status: 400 }
-      );
+      return respondWithNoCredits({ error: 'YouTube URL is required' }, 400);
     }
 
     const videoId = extractVideoId(url);
 
     if (!videoId) {
-      return NextResponse.json(
-        { error: 'Invalid YouTube URL' },
-        { status: 400 }
-      );
+      return respondWithNoCredits({ error: 'Invalid YouTube URL' }, 400);
     }
 
-    // Use mock data if enabled (for development when Supadata is rate-limited)
     if (shouldUseMockData()) {
       console.log(
         '[TRANSCRIPT] Using mock data (NEXT_PUBLIC_USE_MOCK_DATA=true)'
       );
       const mockData = getMockTranscript(videoId);
 
-      // Transform mock data to match the expected format
       const rawSegments = mockData.content.map((item: any) => ({
         text: item.text,
         start: item.offset / 1000, // Convert milliseconds to seconds
@@ -40,13 +47,11 @@ async function handler(request: NextRequest) {
 
       // Merge segments into complete sentences for better translation
       const mergedSentences = mergeTranscriptSegmentsIntoSentences(rawSegments);
-      const transformedTranscript = mergedSentences.map(sentence => ({
+      const transformedTranscript = mergedSentences.map((sentence) => ({
         text: sentence.text,
         start: sentence.segments[0].start, // Use first segment's start time
         duration: sentence.segments.reduce((sum, seg) => sum + seg.duration, 0) // Sum all durations
       }));
-
-      console.log('[TRANSCRIPT] Merged', rawSegments.length, 'segments into', transformedTranscript.length, 'sentences');
 
       return NextResponse.json({
         videoId,
@@ -56,13 +61,7 @@ async function handler(request: NextRequest) {
 
     const apiKey = process.env.SUPADATA_API_KEY;
     if (!apiKey) {
-      console.error(
-        '[TRANSCRIPT] SUPADATA_API_KEY environment variable not set'
-      );
-      return NextResponse.json(
-        { error: 'API configuration error' },
-        { status: 500 }
-      );
+      return respondWithNoCredits({ error: 'API configuration error' }, 500);
     }
 
     let transcriptSegments: any[] | null = null;
@@ -121,23 +120,23 @@ async function handler(request: NextRequest) {
 
       if (!response.ok) {
         if (response.status === 404) {
-          return NextResponse.json(
+          return respondWithNoCredits(
             {
               error:
                 'No transcript/captions available for this video. The video may not have subtitles enabled.'
             },
-            { status: 404 }
+            404
           );
         }
 
         if (unsupportedLanguage) {
-          return NextResponse.json(
+          return respondWithNoCredits(
             {
               error: 'Unsupported transcript language',
               details:
                 'We currently support only YouTube videos with English transcripts. Please choose a video that has English captions enabled.'
             },
-            { status: 400 }
+            400
           );
         }
 
@@ -163,7 +162,7 @@ async function handler(request: NextRequest) {
               details: supadataDetails
             };
 
-        return NextResponse.json(errorPayload, { status });
+        return respondWithNoCredits(errorPayload, status);
       }
 
       const candidateContent = Array.isArray(parsedBody?.content)
@@ -175,12 +174,12 @@ async function handler(request: NextRequest) {
         : null;
 
       if (!candidateContent || candidateContent.length === 0) {
-        return NextResponse.json(
+        return respondWithNoCredits(
           {
             error: supadataStatusMessage,
             details: supadataDetails
           },
-          { status: 404 }
+          404
         );
       }
 
@@ -232,34 +231,34 @@ async function handler(request: NextRequest) {
         (!hasReportedLanguages && englishRatio < 0.1 && nonSpaceLength > 0);
 
       if (appearsNonEnglish) {
-        return NextResponse.json(
+        return respondWithNoCredits(
           {
             error: 'Unsupported transcript language',
             details:
               'We currently support only YouTube videos with English transcripts. Please choose a video that has English captions enabled.'
           },
-          { status: 400 }
+          400
         );
       }
     } catch (fetchError) {
       const errorMessage =
         fetchError instanceof Error ? fetchError.message : '';
       if (errorMessage.includes('404')) {
-        return NextResponse.json(
+        return respondWithNoCredits(
           {
             error:
               'No transcript/captions available for this video. The video may not have subtitles enabled.'
           },
-          { status: 404 }
+          404
         );
       }
       throw fetchError;
     }
 
     if (!transcriptSegments || transcriptSegments.length === 0) {
-      return NextResponse.json(
+      return respondWithNoCredits(
         { error: 'No transcript available for this video' },
-        { status: 404 }
+        404
       );
     }
 
@@ -282,13 +281,11 @@ async function handler(request: NextRequest) {
 
     // Merge segments into complete sentences for better translation
     const mergedSentences = mergeTranscriptSegmentsIntoSentences(rawSegments);
-    const transformedTranscript = mergedSentences.map(sentence => ({
+    const transformedTranscript = mergedSentences.map((sentence) => ({
       text: sentence.text,
       start: sentence.segments[0].start, // Use first segment's start time
       duration: sentence.segments.reduce((sum, seg) => sum + seg.duration, 0) // Sum all durations
     }));
-
-    console.log('[TRANSCRIPT] Merged', rawSegments.length, 'segments into', transformedTranscript.length, 'sentences');
 
     return NextResponse.json({
       videoId,
@@ -300,13 +297,7 @@ async function handler(request: NextRequest) {
       stack: error instanceof Error ? error.stack : undefined,
       type: error?.constructor?.name
     });
-    return NextResponse.json(
-      {
-        error: 'Failed to fetch transcript',
-        details: error instanceof Error ? error.message : 'Unknown error'
-      },
-      { status: 500 }
-    );
+    return respondWithNoCredits({ error: 'Failed to fetch transcript' }, 500);
   }
 }
 

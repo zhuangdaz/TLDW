@@ -48,13 +48,20 @@ interface RightColumnTabsProps {
   onSaveNote?: (payload: { text: string; source: NoteSource; sourceId?: string | null; metadata?: NoteMetadata | null }) => Promise<void>;
   onTakeNoteFromSelection?: (payload: SelectionActionPayload) => void;
   editingNote?: EditingNote | null;
-  onSaveEditingNote?: (noteText: string) => void;
+  onSaveEditingNote?: (payload: { noteText: string; selectedText: string }) => void;
   onCancelEditing?: () => void;
   isAuthenticated?: boolean;
   onRequestSignIn?: () => void;
   selectedLanguage?: string | null;
   onRequestTranslation?: (text: string, cacheKey: string) => Promise<string>;
   onLanguageChange?: (languageCode: string | null) => void;
+  onRequestExport?: () => void;
+  exportButtonState?: {
+    tooltip?: string;
+    disabled?: boolean;
+    badgeLabel?: string;
+    isLoading?: boolean;
+  };
 }
 
 export interface RightColumnTabsHandle {
@@ -87,13 +94,14 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
   selectedLanguage = null,
   onRequestTranslation,
   onLanguageChange,
+  onRequestExport,
+  exportButtonState,
 }, ref) => {
   const [activeTab, setActiveTab] = useState<"transcript" | "chat" | "notes">("transcript");
   const [languageSearch, setLanguageSearch] = useState("");
 
   // Get current language - null or 'en' means English
   const currentLanguageCode = selectedLanguage || 'en';
-  const currentLanguage = SUPPORTED_LANGUAGES.find(lang => lang.code === currentLanguageCode) || SUPPORTED_LANGUAGES[0];
 
   // Filter languages based on search
   const filteredLanguages = SUPPORTED_LANGUAGES.filter(lang =>
@@ -126,78 +134,100 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
   return (
     <Card className="h-full flex flex-col overflow-hidden p-0 gap-0 border-0">
       <div className="flex items-center gap-2 p-2 rounded-t-3xl border-b">
-        <DropdownMenu onOpenChange={(open) => {
-          if (!open) setLanguageSearch("");
-          if (activeTab !== "transcript") setActiveTab("transcript");
-        }}>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="sm"
-              className={cn(
-                "flex-1 justify-center gap-2 rounded-2xl",
-                activeTab === "transcript"
-                  ? "bg-neutral-100 text-foreground"
-                  : "text-muted-foreground hover:text-foreground hover:bg-white/50"
-              )}
-            >
-              <Languages className="h-4 w-4" />
-              Transcript
-              <ChevronDown className="h-3 w-3 opacity-50" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-[240px]">
-            <div className="px-2 py-1.5">
-              <div className="relative">
-                <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-muted-foreground" />
-                <Input
-                  placeholder="Search"
-                  value={languageSearch}
-                  onChange={(e) => setLanguageSearch(e.target.value)}
-                  className="h-7 pl-7 text-xs"
-                />
+        <div className="flex-1">
+          <DropdownMenu onOpenChange={(open) => {
+            if (open) setActiveTab("transcript");
+            if (!open) setLanguageSearch("");
+          }}>
+            <div className={cn(
+              "flex items-center gap-0 rounded-2xl w-full",
+              activeTab === "transcript"
+                ? "bg-neutral-100"
+                : "hover:bg-white/50"
+            )}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setActiveTab("transcript")}
+                className={cn(
+                  "flex-1 justify-center gap-2 rounded-l-2xl rounded-r-none border-0",
+                  activeTab === "transcript"
+                    ? "text-foreground hover:bg-neutral-100"
+                    : "text-muted-foreground hover:text-foreground hover:bg-transparent"
+                )}
+              >
+                <Languages className="h-4 w-4" />
+                Transcript
+              </Button>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn(
+                    "rounded-r-2xl rounded-l-none border-0",
+                    activeTab === "transcript"
+                      ? "text-foreground hover:bg-neutral-100"
+                      : "text-muted-foreground hover:text-foreground hover:bg-transparent"
+                  )}
+                >
+                  <ChevronDown className="h-3 w-3 opacity-50" />
+                </Button>
+              </DropdownMenuTrigger>
+            </div>
+            <DropdownMenuContent side="bottom" align="start" sideOffset={4} alignOffset={-200} className="w-[240px]">
+              <div className="px-2 py-1.5">
+                <div className="relative">
+                  <Search className="absolute left-2 top-2 h-3.5 w-3.5 text-muted-foreground" />
+                  <Input
+                    placeholder="Search"
+                    value={languageSearch}
+                    onChange={(e) => setLanguageSearch(e.target.value)}
+                    className="h-7 pl-7 text-xs"
+                  />
+                </div>
               </div>
-            </div>
-            <div className="max-h-[300px] overflow-y-auto">
-              {filteredLanguages.map((lang) => {
-                const isOriginalLanguage = lang.code === 'en';
-                const isTargetLanguage = lang.code === currentLanguageCode && selectedLanguage !== null;
+              <div className="max-h-[300px] overflow-y-auto">
+                {filteredLanguages.map((lang) => {
+                  const isOriginalLanguage = lang.code === 'en';
+                  const isTargetLanguage = lang.code === currentLanguageCode && selectedLanguage !== null;
 
-                return (
-                  <DropdownMenuItem
-                    key={lang.code}
-                    className={cn(
-                      "text-xs cursor-pointer",
-                      isOriginalLanguage && "cursor-default"
-                    )}
-                    disabled={isOriginalLanguage}
-                    onClick={(e) => {
-                      if (!isOriginalLanguage) {
-                        // If selecting English, set to null; otherwise set to the language code
-                        const newLanguage = lang.code === 'en' ? null : lang.code;
-                        onLanguageChange?.(newLanguage);
-                      }
-                    }}
-                  >
-                    <div className="flex items-center justify-between w-full">
-                      <div>
-                        <div className="font-medium">{lang.nativeName}</div>
-                        <div className="text-[10px] text-muted-foreground">{lang.name}</div>
-                      </div>
-                      {isOriginalLanguage ? (
-                        <CheckCircle2 className="w-4 h-4 text-muted-foreground/50" />
-                      ) : isTargetLanguage ? (
-                        <CheckCircle2 className="w-4 h-4 text-foreground fill-background" />
-                      ) : (
-                        <Circle className="w-4 h-4 text-muted-foreground/30" />
+                  return (
+                    <DropdownMenuItem
+                      key={lang.code}
+                      className={cn(
+                        "text-xs cursor-pointer",
+                        isOriginalLanguage && "cursor-default"
                       )}
-                    </div>
-                  </DropdownMenuItem>
-                );
-              })}
-            </div>
-          </DropdownMenuContent>
-        </DropdownMenu>
+                      disabled={isOriginalLanguage}
+                      onClick={(e) => {
+                        // Toggle: if clicking the currently selected language, deselect it
+                        if (lang.code === currentLanguageCode && selectedLanguage !== null) {
+                          onLanguageChange?.(null);
+                        } else {
+                          onLanguageChange?.(lang.code);
+                        }
+                      }}
+                    >
+                      <div className="flex items-center justify-between w-full">
+                        <div>
+                          <div className="font-medium">{lang.nativeName}</div>
+                          <div className="text-[10px] text-muted-foreground">{lang.name}</div>
+                        </div>
+                        {isOriginalLanguage ? (
+                          <CheckCircle2 className="w-4 h-4 text-muted-foreground/50" />
+                        ) : isTargetLanguage ? (
+                          <CheckCircle2 className="w-4 h-4 text-foreground fill-background" />
+                        ) : (
+                          <Circle className="w-4 h-4 text-muted-foreground/30" />
+                        )}
+                      </div>
+                    </DropdownMenuItem>
+                  );
+                })}
+              </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
         {showChatTab && (
           <Button
             variant="ghost"
@@ -245,6 +275,8 @@ export const RightColumnTabs = forwardRef<RightColumnTabsHandle, RightColumnTabs
             videoId={videoId}
             selectedLanguage={selectedLanguage}
             onRequestTranslation={onRequestTranslation}
+            onRequestExport={onRequestExport}
+            exportButtonState={exportButtonState}
           />
         </div>
         <div className={cn("absolute inset-0", (activeTab !== "chat" || !showChatTab) && "hidden")}>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { RightColumnTabs, type RightColumnTabsHandle } from "@/components/right-column-tabs";
 import { YouTubePlayer } from "@/components/youtube-player";
 import { HighlightsPanel } from "@/components/highlights-panel";
@@ -17,24 +17,71 @@ import { SelectionActionPayload, EXPLAIN_SELECTION_EVENT } from "@/components/se
 import { fetchNotes, saveNote } from "@/lib/notes-client";
 import { EditingNote } from "@/components/notes-panel";
 import { useModePreference } from "@/lib/hooks/use-mode-preference";
-import { TranslationBatcher } from "@/lib/translation-batcher";
+import { useTranslation } from "@/lib/hooks/use-translation";
+import { useSubscription } from "@/lib/hooks/use-subscription";
+import { useTranscriptExport } from "@/lib/hooks/use-transcript-export";
 
 // Page state for better UX
 type PageState = 'IDLE' | 'ANALYZING_NEW' | 'LOADING_CACHED';
 type AuthModalTrigger = 'generation-limit' | 'save-video' | 'manual' | 'save-note';
-import { extractVideoId } from "@/lib/utils";
+import { buildVideoSlug, extractVideoId } from "@/lib/utils";
+import { NO_CREDITS_USED_MESSAGE } from "@/lib/no-credits-message";
 import { useElapsedTimer } from "@/lib/hooks/use-elapsed-timer";
 import { Loader2 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { AuthModal } from "@/components/auth-modal";
+import { TranscriptExportDialog } from "@/components/transcript-export-dialog";
+import { TranscriptExportUpsell } from "@/components/transcript-export-upsell";
 import { useAuth } from "@/contexts/auth-context";
 import { backgroundOperation, AbortManager } from "@/lib/promise-utils";
 import { toast } from "sonner";
+import { hasSpeakerMetadata } from "@/lib/transcript-export";
 import { buildSuggestedQuestionFallbacks } from "@/lib/suggested-question-fallback";
 
 const GUEST_LIMIT_MESSAGE = "You've used today's free analysis. Sign in to keep going.";
-const AUTH_LIMIT_MESSAGE = "You get 5 videos per day. Come back tomorrow.";
+const AUTH_LIMIT_MESSAGE = "You've used all 5 free videos this month. Upgrade to Pro for 100 videos/month.";
 const DEFAULT_CLIENT_ERROR = "Something went wrong. Please try again.";
+
+type LimitCheckResponse = {
+  canGenerate: boolean;
+  isAuthenticated: boolean;
+  tier?: 'free' | 'pro' | 'anonymous';
+  reason?: string | null;
+  requiresTopup?: boolean;
+  requiresAuth?: boolean;
+  status?: string | null;
+  warning?: string | null;
+  unlimited?: boolean;
+  willConsumeTopup?: boolean;
+  resetAt?: string | null;
+  usage?: {
+    totalRemaining?: number | null;
+    counted?: number | null;
+    cached?: number | null;
+    baseLimit?: number | null;
+    baseRemaining?: number | null;
+    topupRemaining?: number | null;
+  } | null;
+};
+
+
+function buildLimitExceededMessage(limitData?: LimitCheckResponse | null): string {
+  if (!limitData) {
+    return AUTH_LIMIT_MESSAGE;
+  }
+
+  if (limitData.reason === 'SUBSCRIPTION_INACTIVE') {
+    return 'Your subscription is not active. Visit the billing portal to reactivate and continue generating videos.';
+  }
+
+  if (limitData.tier === 'pro') {
+    return limitData.requiresTopup
+      ? 'You have used all Pro videos this period. Purchase a Top-Up (+20 videos for $3) or wait for your next billing cycle.'
+      : 'You have used your Pro allowance. Wait for your next billing cycle to reset.';
+  }
+
+  return AUTH_LIMIT_MESSAGE;
+}
 
 function normalizeErrorMessage(message: string | undefined, fallback: string = DEFAULT_CLIENT_ERROR): string {
   const trimmed = typeof message === "string" ? message.trim() : "";
@@ -66,19 +113,26 @@ function buildApiErrorMessage(errorData: unknown, fallback: string): string {
       ? record.details.trim()
       : "";
 
-  if (errorText && detailsText) {
-    return normalizeErrorMessage(`${errorText}: ${detailsText}`, fallback);
+  const combinedMessage =
+    errorText && detailsText
+      ? `${errorText}: ${detailsText}`
+      : detailsText || errorText || undefined;
+
+  const baseMessage = normalizeErrorMessage(combinedMessage, fallback);
+
+  const creditsMessage =
+    typeof record.creditsMessage === "string" && record.creditsMessage.trim().length > 0
+      ? record.creditsMessage.trim()
+      : record.noCreditsUsed
+        ? NO_CREDITS_USED_MESSAGE
+        : "";
+
+  if (!creditsMessage) {
+    return baseMessage;
   }
 
-  if (detailsText) {
-    return normalizeErrorMessage(detailsText, fallback);
-  }
-
-  if (errorText) {
-    return normalizeErrorMessage(errorText, fallback);
-  }
-
-  return normalizeErrorMessage(undefined, fallback);
+  const alreadyIncludes = baseMessage.toLowerCase().includes(creditsMessage.toLowerCase());
+  return alreadyIncludes ? baseMessage : `${baseMessage}\n${creditsMessage}`;
 }
 
 export default function AnalyzePage() {
@@ -91,6 +145,7 @@ export default function AnalyzePage() {
   const cachedParamValue = cachedParam?.toLowerCase();
   const isCachedQuery = cachedParamValue === 'true' || cachedParamValue === '1';
   const authErrorParam = searchParams?.get('auth_error');
+  const slugParam = searchParams?.get('slug') ?? null;
   const [pageState, setPageState] = useState<PageState>(() =>
     (routeVideoId || urlParam)
       ? (isCachedQuery ? 'LOADING_CACHED' : 'ANALYZING_NEW')
@@ -127,10 +182,10 @@ export default function AnalyzePage() {
   const rightColumnTabsRef = useRef<RightColumnTabsHandle>(null);
   const abortManager = useRef(new AbortManager());
   const selectedThemeRef = useRef<string | null>(null);
+  const seoPathRef = useRef<string | null>(null);
   const nextThemeRequestIdRef = useRef(0);
   const activeThemeRequestIdRef = useRef<number | null>(null);
   const pendingThemeRequestsRef = useRef(new Map<string, number>());
-  const translationBatcherRef = useRef<TranslationBatcher | null>(null);
 
   // Play All state (lifted from YouTubePlayer)
   const [isPlayingAll, setIsPlayingAll] = useState(false);
@@ -144,7 +199,7 @@ export default function AnalyzePage() {
   const memoizedSetIsPlayingAll = useCallback((value: boolean) => {
     setIsPlayingAll(value);
   }, []);
-  
+
   // Takeaways generation state
   const [, setTakeawaysContent] = useState<string | null>(null);
   const [, setIsGeneratingTakeaways] = useState<boolean>(false);
@@ -154,9 +209,44 @@ export default function AnalyzePage() {
   // Cached suggested questions
   const [cachedSuggestedQuestions, setCachedSuggestedQuestions] = useState<string[] | null>(null);
 
-  // Translation state - null means English (no translation), otherwise language code
-  const [selectedLanguage, setSelectedLanguage] = useState<string | null>(null);
-  const [translationCache, setTranslationCache] = useState<Map<string, string>>(new Map());
+  // Use custom hooks for translation
+  const {
+    selectedLanguage,
+    translationCache,
+    handleRequestTranslation,
+    handleLanguageChange,
+  } = useTranslation();
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const effectiveVideoId = routeVideoId || videoId;
+    if (!effectiveVideoId) {
+      return;
+    }
+
+    const normalizedSlugParam = slugParam?.trim() || null;
+    const derivedSlug = normalizedSlugParam
+      ? normalizedSlugParam
+      : (videoInfo?.title ? buildVideoSlug(videoInfo.title, effectiveVideoId) : null);
+
+    if (!derivedSlug) {
+      return;
+    }
+
+    const targetPath = `/v/${derivedSlug}`;
+
+    if (seoPathRef.current === targetPath || window.location.pathname === targetPath) {
+      seoPathRef.current = targetPath;
+      return;
+    }
+
+    const newUrl = `${targetPath}${window.location.search}`;
+    window.history.replaceState(window.history.state, '', newUrl);
+    seoPathRef.current = targetPath;
+  }, [routeVideoId, videoId, videoInfo?.title, slugParam]);
 
   // Use custom hook for timer logic
   const elapsedTime = useElapsedTimer(generationStartTime);
@@ -166,6 +256,69 @@ export default function AnalyzePage() {
   const { user } = useAuth();
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalTrigger, setAuthModalTrigger] = useState<AuthModalTrigger>('generation-limit');
+
+  // Store current video data in sessionStorage before auth
+  const storeCurrentVideoForAuth = useCallback((id?: string) => {
+    const targetVideoId = id ?? videoId;
+    if (targetVideoId && !user) {
+      try {
+        sessionStorage.setItem('pendingVideoId', targetVideoId);
+      } catch (error) {
+        console.error('Failed to persist pending video ID:', error);
+      }
+    }
+  }, [user, videoId]);
+
+  const handleAuthRequired = useCallback(() => {
+    storeCurrentVideoForAuth();
+    setAuthModalTrigger('manual');
+    setAuthModalOpen(true);
+  }, [storeCurrentVideoForAuth]);
+
+  // Use custom hook for subscription
+  const {
+    subscriptionStatus,
+    isCheckingSubscription,
+    fetchSubscriptionStatus,
+  } = useSubscription({
+    user,
+    onAuthRequired: handleAuthRequired,
+  });
+
+  const hasSpeakerData = useMemo(() => hasSpeakerMetadata(transcript), [transcript]);
+
+  // Use custom hook for transcript export
+  const {
+    isExportDialogOpen,
+    exportFormat,
+    includeTimestamps,
+    includeSpeakers,
+    exportErrorMessage,
+    exportDisableMessage,
+    isExportingTranscript,
+    showExportUpsell,
+    exportButtonState,
+    setExportFormat,
+    setIncludeTimestamps,
+    setIncludeSpeakers,
+    setShowExportUpsell,
+    handleExportDialogOpenChange,
+    handleRequestExport,
+    handleConfirmExport,
+    handleUpgradeClick,
+  } = useTranscriptExport({
+    videoId,
+    transcript,
+    topics,
+    videoInfo,
+    user,
+    hasSpeakerData,
+    subscriptionStatus,
+    isCheckingSubscription,
+    fetchSubscriptionStatus,
+    onAuthRequired: handleAuthRequired,
+  });
+
   const [rateLimitInfo, setRateLimitInfo] = useState<{
     remaining: number | null;
     resetAt: Date | null;
@@ -193,19 +346,6 @@ export default function AnalyzePage() {
   const clearPlaybackCommand = useCallback(() => {
     setPlaybackCommand(null);
   }, []);
-
-  // Store current video data in sessionStorage before auth
-  const storeCurrentVideoForAuth = useCallback((id?: string) => {
-    const targetVideoId = id ?? videoId;
-    if (targetVideoId && !user) {
-      try {
-        sessionStorage.setItem('pendingVideoId', targetVideoId);
-        console.log('Stored video for post-auth linking:', targetVideoId);
-      } catch (error) {
-        console.error('Failed to persist pending video ID:', error);
-      }
-    }
-  }, [user, videoId]);
 
   const promptSignInForNotes = useCallback(() => {
     if (user) return;
@@ -313,26 +453,27 @@ export default function AnalyzePage() {
     }
   };
 
-  const checkRateLimit = useCallback(async () => {
+  const checkRateLimit = useCallback(async (): Promise<LimitCheckResponse | null> => {
     try {
       const response = await fetch('/api/check-limit');
-      const data = await response.json();
+      const data: LimitCheckResponse = await response.json();
 
-      setAuthLimitReached(Boolean(data?.isAuthenticated && data?.canGenerate === false));
+      setAuthLimitReached(Boolean(data?.isAuthenticated && data?.canGenerate === false && data?.reason === 'LIMIT_REACHED'));
 
-      if (Object.prototype.hasOwnProperty.call(data ?? {}, 'remaining')) {
-        const remainingValue =
-          typeof data.remaining === 'number'
-            ? data.remaining
-            : data.remaining === null
-              ? null
-              : -1;
+      const usage = data?.usage;
+      const remainingValue =
+        typeof usage?.totalRemaining === 'number'
+          ? usage.totalRemaining
+          : usage?.totalRemaining === null
+            ? null
+            : -1;
 
-        setRateLimitInfo({
-          remaining: remainingValue,
-          resetAt: data.resetAt ? new Date(data.resetAt) : null
-        });
-      }
+      const resetTimestamp = data?.resetAt ?? null;
+
+      setRateLimitInfo({
+        remaining: remainingValue,
+        resetAt: resetTimestamp ? new Date(resetTimestamp) : null,
+      });
 
       return data;
     } catch (error) {
@@ -361,14 +502,9 @@ export default function AnalyzePage() {
   // Cleanup AbortManager on component unmount
   useEffect(() => {
     const currentAbortManager = abortManager.current;
-    const currentBatcher = translationBatcherRef.current;
     return () => {
       // Abort all pending requests when component unmounts
       currentAbortManager.cleanup();
-      // Clear any pending translation batches
-      if (currentBatcher) {
-        currentBatcher.clear();
-      }
     };
   }, []);
 
@@ -395,22 +531,36 @@ export default function AnalyzePage() {
   // Check if user can generate based on server-side rate limits
   const checkGenerationLimit = useCallback((
     pendingVideoId?: string,
-    remainingOverride?: number | null
+    remainingOverride?: number | null,
+    latestLimitData?: LimitCheckResponse | null
   ): boolean => {
     if (user) {
-      if (authLimitReached) {
+      const limitReached =
+        latestLimitData?.isAuthenticated
+          ? latestLimitData.canGenerate === false
+          : authLimitReached;
+
+      if (limitReached) {
+        const limitMessage = buildLimitExceededMessage(latestLimitData);
         setIsRateLimitError(true);
-        setError(AUTH_LIMIT_MESSAGE);
-        toast.error(AUTH_LIMIT_MESSAGE);
+        setError(limitMessage);
+        toast.error(limitMessage);
         return false;
       }
       return true;
     }
 
-    const effectiveRemaining =
+    let effectiveRemaining =
       typeof remainingOverride === 'number' || remainingOverride === null
         ? remainingOverride
         : rateLimitInfo.remaining;
+
+    if (!latestLimitData?.isAuthenticated) {
+      const totalRemaining = latestLimitData?.usage?.totalRemaining;
+      if (typeof totalRemaining === 'number' || totalRemaining === null) {
+        effectiveRemaining = totalRemaining;
+      }
+    }
 
     if (
       typeof effectiveRemaining === 'number' &&
@@ -550,6 +700,11 @@ export default function AnalyzePage() {
           setLoadingStage(null);
           setProcessingStartTime(null);
 
+          // Show contextual notification for cached analysis
+          if (user && !cacheData.ownedByCurrentUser) {
+            toast.success("Lucky you — Someone's already analyzed this video! No credits used.");
+          }
+
           backgroundOperation(
             'load-cached-themes',
             async () => {
@@ -645,20 +800,16 @@ export default function AnalyzePage() {
       }
 
       let effectiveRemaining = currentRemaining;
+      const latestLimitData = await checkRateLimit();
 
-      if (!user) {
-        const latestLimitData = await checkRateLimit();
-        if (latestLimitData && Object.prototype.hasOwnProperty.call(latestLimitData, 'remaining')) {
-          effectiveRemaining =
-            typeof latestLimitData.remaining === 'number'
-              ? latestLimitData.remaining
-              : latestLimitData.remaining === null
-                ? null
-                : effectiveRemaining;
+      if (!user && latestLimitData) {
+        const totalRemaining = latestLimitData.usage?.totalRemaining;
+        if (typeof totalRemaining === 'number' || totalRemaining === null) {
+          effectiveRemaining = totalRemaining;
         }
       }
 
-      if (!checkGenerationLimit(extractedVideoId, effectiveRemaining)) {
+      if (!checkGenerationLimit(extractedVideoId, effectiveRemaining, latestLimitData)) {
         return;
       }
 
@@ -752,7 +903,7 @@ export default function AnalyzePage() {
 
       // Move to understanding stage
       setLoadingStage('understanding');
-      
+
       // Generate quick preview (non-blocking)
       fetch("/api/quick-preview", {
         method: "POST",
@@ -781,7 +932,7 @@ export default function AnalyzePage() {
         .catch((error) => {
           console.error('Error generating quick preview:', error);
         });
-      
+
       // Initiate parallel API requests for topics and takeaways
       setLoadingStage('generating');
       setGenerationStartTime(Date.now());
@@ -1032,8 +1183,8 @@ export default function AnalyzePage() {
 
           const questions = Array.isArray((parsed as any)?.questions)
             ? (parsed as any).questions
-                .filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0)
-                .map((item: string) => item.trim())
+              .filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0)
+              .map((item: string) => item.trim())
             : [];
 
           const normalizedQuestions = questions.length > 0
@@ -1067,7 +1218,7 @@ export default function AnalyzePage() {
           console.error("Failed to generate suggested questions:", error);
         }
       );
-      
+
     } catch (err) {
       setError(
         normalizeErrorMessage(
@@ -1113,7 +1264,7 @@ export default function AnalyzePage() {
     // Reset Play All mode when clicking a citation
     setIsPlayingAll(false);
     setPlayAllIndex(0);
-    
+
     setSelectedTopic(null);
     setCitationHighlight(citation);
 
@@ -1387,7 +1538,7 @@ export default function AnalyzePage() {
     const adjustRightColumnHeight = () => {
       const videoContainer = document.getElementById("video-container");
       const rightColumnContainer = document.getElementById("right-column-container");
-      
+
       if (videoContainer && rightColumnContainer) {
         const videoHeight = videoContainer.offsetHeight;
         setTranscriptHeight(`${videoHeight}px`);
@@ -1399,7 +1550,7 @@ export default function AnalyzePage() {
 
     // Adjust on window resize
     window.addEventListener("resize", adjustRightColumnHeight);
-    
+
     // Also observe video container for size changes
     const resizeObserver = new ResizeObserver(adjustRightColumnHeight);
     const videoContainer = document.getElementById("video-container");
@@ -1485,7 +1636,7 @@ export default function AnalyzePage() {
     });
   }, [promptSignInForNotes, user]);
 
-  const handleSaveEditingNote = useCallback(async (noteText: string) => {
+  const handleSaveEditingNote = useCallback(async ({ noteText, selectedText }: { noteText: string; selectedText: string }) => {
     if (!editingNote || !videoId) return;
 
     // Use source from editing note or determine from metadata
@@ -1498,11 +1649,19 @@ export default function AnalyzePage() {
       source = "transcript";
     }
 
+    const normalizedSelected = selectedText.trim();
+    const mergedMetadata = normalizedSelected
+      ? {
+          ...(editingNote.metadata ?? {}),
+          selectedText: normalizedSelected,
+        }
+      : editingNote.metadata ?? undefined;
+
     await handleSaveNote({
       text: noteText,
       source,
       sourceId: editingNote.metadata?.chat?.messageId ?? null,
-      metadata: editingNote.metadata,
+      metadata: mergedMetadata,
     });
 
     // Clear editing state
@@ -1511,59 +1670,6 @@ export default function AnalyzePage() {
 
   const handleCancelEditing = useCallback(() => {
     setEditingNote(null);
-  }, []);
-
-  // Translation handler with batching
-  const handleRequestTranslation = useCallback(async (text: string, cacheKey: string): Promise<string> => {
-    if (!selectedLanguage) return text;
-
-    // Initialize batcher lazily on first use
-    if (!translationBatcherRef.current) {
-      translationBatcherRef.current = new TranslationBatcher(
-        50, // Wait 50ms to collect translation requests
-        100, // Max 100 translations per batch
-        translationCache,
-        selectedLanguage // Pass the target language
-      );
-    }
-
-    // Use the batcher - it will automatically batch requests and cache results
-    const translation = await translationBatcherRef.current.translate(text, cacheKey);
-
-    // Sync cache state (the batcher updates the Map, but we need to trigger re-render)
-    // Implements LRU-like eviction to prevent unbounded memory growth
-    setTranslationCache(prev => {
-      if (prev.has(cacheKey) && prev.get(cacheKey) === translation) {
-        return prev; // No change, don't trigger re-render
-      }
-
-      const next = new Map(prev);
-
-      // Evict oldest entry if cache exceeds limit (500 entries ~= 50KB)
-      const MAX_CACHE_SIZE = 500;
-      if (next.size >= MAX_CACHE_SIZE) {
-        const firstKey = next.keys().next().value;
-        next.delete(firstKey);
-      }
-
-      next.set(cacheKey, translation);
-      return next;
-    });
-
-    return translation;
-  }, [translationCache, selectedLanguage]);
-
-  const handleLanguageChange = useCallback((languageCode: string | null) => {
-    setSelectedLanguage(languageCode);
-    // Keep cache since keys are now language-aware (e.g., "topic-1:es", "topic-1:fr")
-    // No need to clear - different languages use different cache keys
-    if (translationBatcherRef.current && languageCode) {
-      translationBatcherRef.current.updateLanguage(languageCode);
-    } else if (translationBatcherRef.current) {
-      // If switching back to English (null), clear the batcher entirely
-      translationBatcherRef.current.clear();
-      translationBatcherRef.current = null;
-    }
   }, []);
 
   return (
@@ -1641,7 +1747,7 @@ export default function AnalyzePage() {
             <div className="space-y-4">
               <div>
                 <h2 className="text-xl font-semibold text-slate-900">
-                  {isRateLimitError ? 'Daily limit reached' : 'We couldn\'t finish analyzing this video'}
+                  {isRateLimitError ? 'Monthly limit reached' : 'We couldn\'t finish analyzing this video'}
                 </h2>
                 <p className="mt-1.5 text-sm leading-relaxed text-slate-600">
                   {isRateLimitError
@@ -1656,6 +1762,14 @@ export default function AnalyzePage() {
                 >
                   Go to home
                 </Link>
+                {isRateLimitError && (
+                  <Link
+                    href="/pricing"
+                    className="inline-flex items-center justify-center rounded-full bg-blue-600 px-4 py-2 text-xs font-medium text-white transition hover:bg-blue-700"
+                  >
+                    Upgrade to Pro
+                  </Link>
+                )}
                 {!isRateLimitError && (
                   <button
                     type="button"
@@ -1699,6 +1813,8 @@ export default function AnalyzePage() {
                   setIsPlayingAll={memoizedSetIsPlayingAll}
                   renderControls={false}
                   onDurationChange={setVideoDuration}
+                  selectedLanguage={selectedLanguage}
+                  onRequestTranslation={handleRequestTranslation}
                 />
                 {(themes.length > 0 || isLoadingThemeTopics || themeError || selectedTheme) && (
                   <div className="flex justify-center">
@@ -1708,6 +1824,8 @@ export default function AnalyzePage() {
                       onSelect={handleThemeSelect}
                       isLoading={isLoadingThemeTopics}
                       error={themeError}
+                      selectedLanguage={selectedLanguage}
+                      onRequestTranslation={handleRequestTranslation}
                     />
                   </div>
                 )}
@@ -1763,6 +1881,8 @@ export default function AnalyzePage() {
                   selectedLanguage={selectedLanguage}
                   onRequestTranslation={handleRequestTranslation}
                   onLanguageChange={handleLanguageChange}
+                  onRequestExport={handleRequestExport}
+                  exportButtonState={exportButtonState}
                 />
               </div>
             </div>
@@ -1789,6 +1909,29 @@ export default function AnalyzePage() {
           // Check for pending video linking will happen via useEffect
         }}
         currentVideoId={videoId}
+      />
+      <TranscriptExportDialog
+        open={isExportDialogOpen}
+        onOpenChange={handleExportDialogOpenChange}
+        format={exportFormat}
+        onFormatChange={setExportFormat}
+        includeSpeakers={includeSpeakers}
+        onIncludeSpeakersChange={(value) => setIncludeSpeakers(value && hasSpeakerData)}
+        includeTimestamps={includeTimestamps}
+        onIncludeTimestampsChange={setIncludeTimestamps}
+        disableTimestampToggle={exportFormat === 'srt'}
+        onConfirm={handleConfirmExport}
+        isExporting={isExportingTranscript}
+        error={exportErrorMessage}
+        disableDownloadMessage={exportDisableMessage}
+        hasSpeakerData={hasSpeakerData}
+        willConsumeTopup={subscriptionStatus?.willConsumeTopup}
+        videoTitle={videoInfo?.title}
+      />
+      <TranscriptExportUpsell
+        open={showExportUpsell}
+        onOpenChange={setShowExportUpsell}
+        onUpgradeClick={handleUpgradeClick}
       />
     </div>
   );

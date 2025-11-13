@@ -11,12 +11,173 @@ export interface MergedSentence {
 }
 
 /**
+ * Check if a period at the given position is truly sentence-ending
+ * Returns false for decimal numbers, URLs, abbreviations, file extensions
+ */
+function isSentenceEndingPeriod(text: string, periodIndex: number): boolean {
+  // Get characters before and after the period
+  const before = text.charAt(periodIndex - 1);
+  const after = text.charAt(periodIndex + 1);
+
+  // Decimal number: digit before and digit after (e.g., "2.2", "3.14")
+  if (/\d/.test(before) && /\d/.test(after)) {
+    return false;
+  }
+
+  // Check for common TLDs and file extensions (e.g., ".com", ".org", ".txt")
+  // Look at the next few characters after the period
+  const afterPeriod = text.slice(periodIndex + 1, periodIndex + 5).toLowerCase();
+  const commonPatterns = [
+    'com', 'org', 'net', 'edu', 'gov', 'co', 'io', 'ai', 'dev',
+    'txt', 'pdf', 'jpg', 'png', 'gif', 'doc', 'zip', 'html', 'js', 'ts'
+  ];
+
+  for (const pattern of commonPatterns) {
+    // Check if pattern matches and is followed by space, punctuation, or end of string
+    if (afterPeriod.startsWith(pattern)) {
+      const charAfterPattern = text.charAt(periodIndex + 1 + pattern.length);
+      if (!charAfterPattern || /[\s,;!?]/.test(charAfterPattern)) {
+        return false; // It's a TLD or file extension
+      }
+    }
+  }
+
+  // Common abbreviations (check 1-3 chars before period)
+  const beforePeriod = text.slice(Math.max(0, periodIndex - 3), periodIndex).toLowerCase();
+  const commonAbbrevs = ['dr', 'mr', 'mrs', 'ms', 'vs', 'etc', 'inc', 'ltd', 'jr', 'sr'];
+
+  for (const abbrev of commonAbbrevs) {
+    if (beforePeriod.endsWith(abbrev)) {
+      return false;
+    }
+  }
+
+  // If none of the above patterns match, it's likely a sentence-ending period
+  return true;
+}
+
+/**
  * Check if text ends with a sentence-ending punctuation
  */
 function endsWithSentence(text: string): boolean {
   const trimmed = text.trim();
-  // Check for sentence endings: period, question mark, exclamation, or Chinese/Japanese punctuation
-  return /[.!?\u3002\uff01\uff1f\u203c\u2047\u2048]$/.test(trimmed);
+
+  // Check for non-period sentence endings: question mark, exclamation, or Chinese/Japanese punctuation
+  if (/[!?\u3002\uff01\uff1f\u203c\u2047\u2048]$/.test(trimmed)) {
+    return true;
+  }
+
+  // Check for period - need to verify it's truly sentence-ending
+  if (trimmed.endsWith('.')) {
+    const periodIndex = trimmed.length - 1;
+    return isSentenceEndingPeriod(trimmed, periodIndex);
+  }
+
+  return false;
+}
+
+/**
+ * Find sentence-ending punctuation near the beginning of text (within first 2 words)
+ * Returns the index position right after the punctuation, or -1 if none found
+ */
+function findEarlyPunctuation(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return -1;
+
+  // Regex to find all potential sentence-ending punctuation
+  const sentencePunctuationRegex = /[.!?\u3002\uff01\uff1f\u203c\u2047\u2048]/g;
+
+  // Find all punctuation positions
+  const matches: number[] = [];
+  let match;
+  while ((match = sentencePunctuationRegex.exec(trimmed)) !== null) {
+    matches.push(match.index);
+  }
+
+  if (matches.length === 0) return -1;
+
+  // Filter to only include truly sentence-ending punctuation
+  const sentenceEndingMatches = matches.filter(index => {
+    const char = trimmed.charAt(index);
+
+    // Non-period punctuation is always sentence-ending
+    if (char !== '.') {
+      return true;
+    }
+
+    // For periods, check if they're truly sentence-ending
+    return isSentenceEndingPeriod(trimmed, index);
+  });
+
+  if (sentenceEndingMatches.length === 0) return -1;
+
+  // Get the first true sentence-ending punctuation position
+  const firstPuncIndex = sentenceEndingMatches[0];
+
+  // Get text before the punctuation
+  const beforePunc = trimmed.slice(0, firstPuncIndex).trim();
+
+  // Count words before punctuation
+  const wordsBefore = beforePunc ? beforePunc.split(/\s+/).length : 0;
+
+  // If 0-2 words before punctuation, this is early punctuation
+  if (wordsBefore >= 0 && wordsBefore <= 2) {
+    return firstPuncIndex + 1; // Return position right after punctuation
+  }
+
+  return -1;
+}
+
+/**
+ * Find sentence-ending punctuation near the end of text (within last 2 words)
+ * Returns the index position right after the punctuation, or -1 if none found
+ */
+function findLatePunctuation(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return -1;
+
+  // Regex to find all potential sentence-ending punctuation
+  const sentencePunctuationRegex = /[.!?\u3002\uff01\uff1f\u203c\u2047\u2048]/g;
+
+  // Find all punctuation positions
+  const matches: number[] = [];
+  let match;
+  while ((match = sentencePunctuationRegex.exec(trimmed)) !== null) {
+    matches.push(match.index);
+  }
+
+  if (matches.length === 0) return -1;
+
+  // Filter to only include truly sentence-ending punctuation
+  const sentenceEndingMatches = matches.filter(index => {
+    const char = trimmed.charAt(index);
+
+    // Non-period punctuation is always sentence-ending
+    if (char !== '.') {
+      return true;
+    }
+
+    // For periods, check if they're truly sentence-ending
+    return isSentenceEndingPeriod(trimmed, index);
+  });
+
+  if (sentenceEndingMatches.length === 0) return -1;
+
+  // Get the last true sentence-ending punctuation position
+  const lastPuncIndex = sentenceEndingMatches[sentenceEndingMatches.length - 1];
+
+  // Get text after the punctuation
+  const afterPunc = trimmed.slice(lastPuncIndex + 1).trim();
+
+  // Count words after punctuation
+  const wordsAfter = afterPunc ? afterPunc.split(/\s+/).length : 0;
+
+  // If 1-2 words after punctuation, we should split here
+  if (wordsAfter >= 1 && wordsAfter <= 2) {
+    return lastPuncIndex + 1; // Return position right after punctuation
+  }
+
+  return -1;
 }
 
 /**
@@ -36,16 +197,94 @@ export function mergeTranscriptSegmentsIntoSentences(
   let currentSentence: string[] = [];
   let currentSegments: TranscriptSegment[] = [];
   let startIndex = 0;
+  let carryoverText = ''; // Text to prepend to next segment
 
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
-    const text = segment.text || '';
+    let text = segment.text || '';
+
+    // Prepend carryover text from previous segment split
+    if (carryoverText) {
+      text = carryoverText + ' ' + text;
+      carryoverText = '';
+    }
 
     // Skip empty segments
     if (!text.trim()) {
       // If we have accumulated text, still count this as part of the sentence
       if (currentSentence.length > 0) {
         currentSegments.push(segment);
+      }
+      continue;
+    }
+
+    // Check for early punctuation (within first 2 words)
+    // This handles cases like ". You should" that should attach to previous sentence
+    const earlySplitPos = findEarlyPunctuation(text);
+    if (earlySplitPos > 0 && currentSentence.length > 0) {
+      // Split the text at the early punctuation
+      const beforeEarlyPunc = text.slice(0, earlySplitPos).trim();
+      const afterEarlyPunc = text.slice(earlySplitPos).trim();
+
+      // Add text before punctuation (including punctuation) to current sentence
+      if (beforeEarlyPunc) {
+        currentSentence.push(beforeEarlyPunc);
+      }
+      currentSegments.push(segment);
+
+      // Complete the current sentence
+      merged.push({
+        text: currentSentence.join(' ').replace(/\s+/g, ' ').trim(),
+        startIndex,
+        endIndex: i,
+        segments: [...currentSegments]
+      });
+
+      // Reset for next sentence
+      currentSentence = [];
+      currentSegments = [];
+
+      // Continue processing the rest of the text after early punctuation
+      if (afterEarlyPunc) {
+        text = afterEarlyPunc;
+        // Don't set startIndex yet - will be set below when adding to sentence
+      } else {
+        // No more text in this segment after early punctuation
+        continue;
+      }
+    }
+
+    // Check for late punctuation (within last 2 words)
+    const splitPos = findLatePunctuation(text);
+    if (splitPos > 0) {
+      // Split the text at the punctuation
+      const beforePunc = text.slice(0, splitPos).trim();
+      const afterPunc = text.slice(splitPos).trim();
+
+      // Add text before punctuation to current sentence
+      if (currentSentence.length === 0) {
+        startIndex = i;
+      }
+      if (beforePunc) {
+        currentSentence.push(beforePunc);
+      }
+      currentSegments.push(segment);
+
+      // Complete the current sentence
+      merged.push({
+        text: currentSentence.join(' ').replace(/\s+/g, ' ').trim(),
+        startIndex,
+        endIndex: i,
+        segments: [...currentSegments]
+      });
+
+      // Reset for next sentence
+      currentSentence = [];
+      currentSegments = [];
+
+      // Store text after punctuation as carryover for next segment
+      if (afterPunc) {
+        carryoverText = afterPunc;
       }
       continue;
     }
@@ -83,59 +322,15 @@ export function mergeTranscriptSegmentsIntoSentences(
     });
   }
 
-  return merged;
-}
-
-/**
- * Map translated sentences back to individual segment translations
- *
- * @param mergedSentences - Array of merged sentences
- * @param translations - Array of translated texts (must match length of mergedSentences)
- * @returns Map of segment index to translated text
- */
-export function mapTranslationsToSegments(
-  mergedSentences: MergedSentence[],
-  translations: string[]
-): Map<number, string> {
-  const segmentTranslations = new Map<number, string>();
-
-  if (mergedSentences.length !== translations.length) {
-    console.error('[SENTENCE-MERGER] Translation count mismatch', {
-      sentences: mergedSentences.length,
-      translations: translations.length
+  // Handle any remaining carryover text from last segment
+  if (carryoverText.trim()) {
+    merged.push({
+      text: carryoverText.trim(),
+      startIndex: segments.length - 1,
+      endIndex: segments.length - 1,
+      segments: [segments[segments.length - 1]]
     });
-    return segmentTranslations;
   }
 
-  for (let i = 0; i < mergedSentences.length; i++) {
-    const sentence = mergedSentences[i];
-    const translation = translations[i];
-
-    // For now, assign the full translated sentence to each segment
-    // In the future, we could try to split the translation proportionally
-    for (let segIdx = sentence.startIndex; segIdx <= sentence.endIndex; segIdx++) {
-      segmentTranslations.set(segIdx, translation);
-    }
-  }
-
-  return segmentTranslations;
-}
-
-/**
- * Get the sentence group for a specific segment index
- *
- * @param segmentIndex - Index of the segment
- * @param mergedSentences - Array of merged sentences
- * @returns The merged sentence containing this segment, or null if not found
- */
-export function getSentenceForSegment(
-  segmentIndex: number,
-  mergedSentences: MergedSentence[]
-): MergedSentence | null {
-  for (const sentence of mergedSentences) {
-    if (segmentIndex >= sentence.startIndex && segmentIndex <= sentence.endIndex) {
-      return sentence;
-    }
-  }
-  return null;
+  return merged;
 }
